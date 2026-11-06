@@ -1,0 +1,13 @@
+.{
+    .name = .skills,
+    .version = "0.1.0",
+    .fingerprint = 0xd53116704126407b,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .libyaml = .{
+            .url = "https://github.com/yaml/libyaml/archive/refs/tags/0.2.5.tar.gz",
+            .hash = "N-V-__8AAFisCAAMQCHLFuzfjTcHCY_2lOFAyfksvXa7HzDL",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "root.zig", "tests.zig", "yaml_shim.c", "README.md", "THIRD_PARTY_NOTICES" },
+}
