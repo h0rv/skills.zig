@@ -5,7 +5,25 @@
 
 typedef struct { int kind; const unsigned char *data; size_t len; int id; } sy_node;
 typedef struct { size_t line, column; } sy_issue;
-typedef struct { yaml_document_t document; } sy_document;
+typedef struct {
+    yaml_document_t document;
+    /* One type per non-alias node, in libyaml document node order. The event
+       flags distinguish implicit scalars from explicit !!str scalars. */
+    unsigned char *kinds;
+} sy_document;
+
+static int append_kind(unsigned char **kinds, size_t *count, size_t *capacity, int kind) {
+    if (*count == *capacity) {
+        size_t next = *capacity ? *capacity * 2 : 16;
+        if (next < *capacity) return 0;
+        unsigned char *grown = realloc(*kinds, next);
+        if (!grown) return 0;
+        *kinds = grown;
+        *capacity = next;
+    }
+    (*kinds)[(*count)++] = (unsigned char)kind;
+    return 1;
+}
 
 /* YAML 1.2 core scalar resolution. libyaml parses syntax but does not resolve
    implicit scalar tags. Quoted, block, and !!str or ! tagged values stay strings. */
@@ -61,6 +79,8 @@ int sy_parse(const unsigned char *text, size_t len, size_t max_nodes,
     yaml_parser_t parser;
     yaml_event_t event;
     size_t nodes = 0, depth = 0, documents = 0;
+    size_t kind_count = 0, kind_capacity = 0;
+    unsigned char *kinds = NULL;
     int status = 0, done = 0;
     *out = NULL;
     issue->line = issue->column = 0;
@@ -73,21 +93,28 @@ int sy_parse(const unsigned char *text, size_t len, size_t max_nodes,
             status = parser.error == YAML_MEMORY_ERROR ? 4 : 1;
             break;
         }
+        int kind = -1;
         switch (event.type) {
         case YAML_DOCUMENT_START_EVENT: if (++documents > 1) status = 5; break;
         case YAML_MAPPING_START_EVENT:
         case YAML_SEQUENCE_START_EVENT:
             depth++;
             if (++nodes > max_nodes || depth > max_depth) status = 3;
-            if (event.type == YAML_MAPPING_START_EVENT && event.data.mapping_start.tag &&
-                strcmp((const char *)event.data.mapping_start.tag, YAML_MAP_TAG) != 0 &&
-                strcmp((const char *)event.data.mapping_start.tag, "!") != 0) status = 2;
+            if (event.type == YAML_MAPPING_START_EVENT) {
+                const unsigned char *tag = event.data.mapping_start.tag;
+                kind = !tag || strcmp((const char *)tag, YAML_MAP_TAG) == 0 ||
+                       strcmp((const char *)tag, "!") == 0 ? 3 : 0;
+            } else {
+                const unsigned char *tag = event.data.sequence_start.tag;
+                kind = !tag || strcmp((const char *)tag, YAML_SEQ_TAG) == 0 ||
+                       strcmp((const char *)tag, "!") == 0 ? 2 : 0;
+            }
             break;
         case YAML_MAPPING_END_EVENT:
         case YAML_SEQUENCE_END_EVENT: depth--; break;
         case YAML_SCALAR_EVENT:
             if (++nodes > max_nodes) status = 3;
-            else if (!string_scalar(&event)) status = 2;
+            kind = string_scalar(&event) ? 1 : 0;
             break;
         case YAML_ALIAS_EVENT:
             /* Aliases are supported by libyaml without recursive expansion. */
@@ -96,6 +123,7 @@ int sy_parse(const unsigned char *text, size_t len, size_t max_nodes,
         case YAML_STREAM_END_EVENT: done = 1; break;
         default: break;
         }
+        if (!status && kind >= 0 && !append_kind(&kinds, &kind_count, &kind_capacity, kind)) status = 4;
         if (status) {
             issue->line = event.start_mark.line + 1;
             issue->column = event.start_mark.column + 1;
@@ -104,16 +132,18 @@ int sy_parse(const unsigned char *text, size_t len, size_t max_nodes,
         if (status) break;
     }
     yaml_parser_delete(&parser);
-    if (status) return status;
+    if (status) { free(kinds); return status; }
     sy_document *doc = malloc(sizeof(*doc));
-    if (!doc) return 4;
-    if (!yaml_parser_initialize(&parser)) { free(doc); return 4; }
+    if (!doc) { free(kinds); return 4; }
+    doc->kinds = kinds;
+    if (!yaml_parser_initialize(&parser)) { free(kinds); free(doc); return 4; }
     yaml_parser_set_input_string(&parser, text, len);
     if (!yaml_parser_load(&parser, &doc->document)) {
         issue->line = parser.problem_mark.line + 1;
         issue->column = parser.problem_mark.column + 1;
         status = parser.error == YAML_MEMORY_ERROR ? 4 : 1;
         yaml_parser_delete(&parser);
+        free(kinds);
         free(doc);
         return status;
     }
@@ -123,14 +153,16 @@ int sy_parse(const unsigned char *text, size_t len, size_t max_nodes,
 }
 void sy_free(sy_document *doc) {
     yaml_document_delete(&doc->document);
+    free(doc->kinds);
     free(doc);
 }
 static sy_node node_view(sy_document *doc, int id) {
     yaml_node_t *n = yaml_document_get_node(&doc->document, id);
     sy_node v = { 0, NULL, 0, id };
     if (!n) return v;
-    v.kind = n->type;
+    v.kind = doc->kinds[id - 1];
     if (n->type == YAML_SCALAR_NODE) { v.data = n->data.scalar.value; v.len = n->data.scalar.length; }
+    if (n->type == YAML_SEQUENCE_NODE) v.len = (size_t)(n->data.sequence.items.top - n->data.sequence.items.start);
     if (n->type == YAML_MAPPING_NODE) v.len = (size_t)(n->data.mapping.pairs.top - n->data.mapping.pairs.start);
     return v;
 }
@@ -143,4 +175,8 @@ void sy_pair(sy_document *doc, int id, size_t index, sy_node *key, sy_node *valu
     yaml_node_pair_t pair = n->data.mapping.pairs.start[index];
     *key = node_view(doc, pair.key);
     *value = node_view(doc, pair.value);
+}
+sy_node sy_item(sy_document *doc, int id, size_t index) {
+    yaml_node_t *n = yaml_document_get_node(&doc->document, id);
+    return node_view(doc, n->data.sequence.items.start[index]);
 }

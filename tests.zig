@@ -87,7 +87,11 @@ test "invalid YAML types duplicates syntax and delimiters are diagnostics" {
         .{ .dir = "root-list", .yaml = "- name: root-list" },
         .{ .dir = "tag", .yaml = "name: tag\ndescription: !!int '12'" },
         .{ .dir = "custom-tag", .yaml = "name: custom-tag\ndescription: !custom 12" },
-        .{ .dir = "unknown", .yaml = "name: unknown\ndescription: ok\ncustom: value" },
+        .{ .dir = "tools-number", .yaml = "name: tools-number\ndescription: ok\nallowed-tools: [Read, 12]" },
+        .{ .dir = "tools-map", .yaml = "name: tools-map\ndescription: ok\nallowed-tools: {tool: Read}" },
+        .{ .dir = "tools-recursive", .yaml = "name: tools-recursive\ndescription: ok\nallowed-tools: &tools [*tools]" },
+        .{ .dir = "alias-number", .yaml = "name: alias-number\ncustom: &n 12\ndescription: *n" },
+        .{ .dir = "tools-tag", .yaml = "name: tools-tag\ndescription: ok\nallowed-tools: !custom [Read]" },
     };
     for (cases) |case| {
         const file = try a.print("{s}/SKILL.md", .{case.dir});
@@ -107,7 +111,6 @@ test "invalid YAML types duplicates syntax and delimiters are diagnostics" {
     try expectDiagnostic(catalog, error.YamlSyntax);
     try expectDiagnostic(catalog, error.UnterminatedFrontmatter);
     try expectDiagnostic(catalog, error.MissingFrontmatter);
-    try expectDiagnostic(catalog, error.UnknownField);
     for (catalog.diagnostics) |diagnostic| {
         if (diagnostic.code == error.YamlSyntax) try t.expect(diagnostic.line > 0 and diagnostic.column > 0);
     }
@@ -232,7 +235,7 @@ test "YAML core scalar resolution never coerces values into strings" {
     for (catalog.diagnostics) |diagnostic| try t.expectEqual(error.UnsupportedFieldType, diagnostic.code);
 }
 
-test "names are strict ASCII and match directory names" {
+test "names retain spec syntax but may differ from directory names" {
     var f = try Fixture.init();
     defer f.deinit();
     const invalid = [_][]const u8{ "Upper", "-start", "end-", "a--b", "ümlaut", "under_score", "", "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklm" };
@@ -247,10 +250,10 @@ test "names are strict ASCII and match directory names" {
     try f.skill("a-1", "ok", "");
     var catalog = try f.catalog(.{});
     defer catalog.deinit();
-    try t.expectEqual(@as(usize, 1), catalog.skills.len);
-    try t.expectEqual(invalid.len + 1, catalog.diagnostics.len);
+    try t.expectEqual(@as(usize, 2), catalog.skills.len);
+    try t.expectEqual(invalid.len, catalog.diagnostics.len);
     try expectDiagnostic(catalog, error.InvalidName);
-    try expectDiagnostic(catalog, error.DirectoryNameMismatch);
+    try t.expectEqualStrings("other", catalog.skills[1].name);
 }
 
 test "Unicode scalar length limits including compatibility" {
@@ -332,7 +335,7 @@ test "ordered roots first VALID name wins absent roots and deterministic duplica
 test "explicit root dots and trailing separators preserve installed names and paths" {
     var f = try Fixture.init();
     defer f.deinit();
-    try f.skill("example", "ok", "body");
+    try f.write("example/SKILL.md", "---\ndescription: ok\n---\nbody");
     try f.tmp.dir.createDirPath(io, "example/child");
     const spellings = [_][]const u8{ "example", "example/.", "example/", "example///", "./example/././/", "example/child/..", "./example/child/.././/" };
     for (spellings) |spelling| {
@@ -359,7 +362,7 @@ test "explicit symlink root dots keep aliases and dotdot follows filesystem sema
     defer installed.deinit();
     var source = try Fixture.init();
     defer source.deinit();
-    try source.write("target/SKILL.md", "---\nname: alias\ndescription: ok\n---\nbody");
+    try source.write("target/SKILL.md", "---\ndescription: ok\n---\nbody");
     try source.skill("destination", "ok", "body");
     try source.tmp.dir.createDirPath(io, "destination/child");
     const target = try a.print("{s}/target", .{source.root});
@@ -533,6 +536,171 @@ fn allocationRun(allocator: std.mem.Allocator, root: []const u8) !void {
     const body = try catalog.skills[0].loadBody(allocator, io, .{});
     defer allocator.free(body);
     try t.expectEqualStrings("body", body);
+}
+
+test "Claude extensions are ignored as bounded data while known fields stay typed" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    // Synthetic frontmatter based on Claude Code's frontmatter reference.
+    try f.write("review/SKILL.md",
+        \\---
+        \\description: >-
+        \\  Review changes and explain
+        \\  what needs attention.
+        \\argument-hint: "[filename] [format]"
+        \\arguments: [filename, format]
+        \\disable-model-invocation: true
+        \\user-invocable: false
+        \\model: inherit
+        \\context: fork
+        \\agent: Explore
+        \\hooks:
+        \\  PreToolUse:
+        \\    - matcher: Bash
+        \\      hooks:
+        \\        - type: command
+        \\          command: "printf 'synthetic only'"
+        \\          once: true
+        \\future-version: 2
+        \\future-null: null
+        \\future-tag: !custom {value: !another false}
+        \\future-recursive: &loop [*loop]
+        \\allowed-tools:
+        \\  - Read
+        \\  - Bash(git:*)
+        \\metadata: {author: Example, version: "1.0"}
+        \\---
+        \\body
+    );
+    var catalog = try f.catalog(.{});
+    defer catalog.deinit();
+    try t.expectEqual(@as(usize, 1), catalog.skills.len);
+    try t.expectEqual(@as(usize, 0), catalog.diagnostics.len);
+    try t.expectEqualStrings("review", catalog.skills[0].name);
+    try t.expectEqualStrings("Review changes and explain what needs attention.", catalog.skills[0].description);
+    try t.expectEqualStrings("Read Bash(git:*)", catalog.skills[0].allowed_tools.?);
+    try t.checkAllAllocationFailures(a, allocationRun, .{f.root});
+}
+
+test "allowed tools strings lists and aliases retain the existing string API" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const cases = [_]struct { yaml: []const u8, expected: []const u8 }{
+        .{ .yaml = "Read Bash(git:*)", .expected = "Read Bash(git:*)" },
+        .{ .yaml = "Read, Bash(git:*)", .expected = "Read, Bash(git:*)" },
+        .{ .yaml = "[Read, 'Bash(git:*)']", .expected = "Read Bash(git:*)" },
+        .{ .yaml = "[]", .expected = "" },
+        .{ .yaml = "*tools", .expected = "Read Grep" },
+    };
+    for (cases, 0..) |case, i| {
+        const file = try a.print("tools-{d}/SKILL.md", .{i});
+        defer a.free(file);
+        const contents = try a.print("---\ndescription: \"Caf\\u00e9 \\U0001F600\"\nextension: &tools [Read, Grep]\nallowed-tools: {s}\n---\nbody", .{case.yaml});
+        defer a.free(contents);
+        try f.write(file, contents);
+    }
+    var catalog = try f.catalog(.{});
+    defer catalog.deinit();
+    try t.expectEqual(cases.len, catalog.skills.len);
+    try t.expectEqual(@as(usize, 0), catalog.diagnostics.len);
+    for (catalog.skills, cases) |skill, case| {
+        try t.expectEqualStrings("Café 😀", skill.description);
+        try t.expectEqualStrings(case.expected, skill.allowed_tools.?);
+        try t.checkAllAllocationFailures(a, allocationRun, .{skill.directory_path});
+    }
+}
+
+test "unknown extension graphs retain syntax node depth and byte budgets" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.write("bounded/SKILL.md", "---\ndescription: ok\nextension: &shared [true, false, null, 12]\naliases: [*shared, *shared, *shared]\n---\nbody");
+    var normal = try f.catalog(.{});
+    defer normal.deinit();
+    try t.expectEqual(@as(usize, 1), normal.skills.len);
+    var nodes = try f.catalog(.{ .max_yaml_nodes = 13 });
+    defer nodes.deinit();
+    try expectDiagnostic(nodes, error.YamlLimit);
+    var depth = try f.catalog(.{ .max_yaml_depth = 1 });
+    defer depth.deinit();
+    try expectDiagnostic(depth, error.YamlLimit);
+    var bytes = try f.catalog(.{ .max_frontmatter_bytes = 32 });
+    defer bytes.deinit();
+    try expectDiagnostic(bytes, error.FrontmatterLimit);
+    try f.write("bounded/SKILL.md", "---\ndescription: ok\nextension: *undefined\n---\nbody");
+    var unresolved = try f.catalog(.{});
+    defer unresolved.deinit();
+    try expectDiagnostic(unresolved, error.YamlSyntax);
+    try f.write("bounded/SKILL.md", "---\ndescription: ok\nextension: [broken\n---\nbody");
+    var broken = try f.catalog(.{});
+    defer broken.deinit();
+    try expectDiagnostic(broken, error.YamlSyntax);
+}
+
+test "extensions cannot hide duplicate known fields or invalid required metadata" {
+    var first = try Fixture.init();
+    defer first.deinit();
+    var second = try Fixture.init();
+    defer second.deinit();
+    const cases = [_][]const u8{
+        "description: ok\ndescription: also ok",
+        "name: valid\nname: valid\ndescription: ok",
+        "description: [not, text]",
+        "description: true",
+        "description: ''",
+        "description: unquoted: colon",
+        "name: valid",
+        "name: ''\ndescription: ok",
+    };
+    for (cases) |yaml| {
+        const contents = try a.print("---\n{s}\nhooks: {{PreToolUse: [{{once: true}}]}}\n---\n# Body must not become a description", .{yaml});
+        defer a.free(contents);
+        try first.write("valid/SKILL.md", contents);
+        try second.skill("valid", "valid fallback", "body");
+        var catalog = try skills.discover(a, io, &.{ first.root, second.root }, .{});
+        defer catalog.deinit();
+        try t.expectEqual(@as(usize, 1), catalog.skills.len);
+        try t.expectEqual(@as(usize, 1), catalog.diagnostics.len);
+        try t.expectEqualStrings("valid fallback", catalog.skills[0].description);
+    }
+}
+
+test "name defaults and explicit aliases revalidate using the installed folder" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.write("folder/SKILL.md", "---\nname: renamed\ndescription: ok\n---\nbody");
+    var catalog = try f.catalog(.{});
+    defer catalog.deinit();
+    try t.expectEqualStrings("renamed", catalog.skills[0].name);
+    const original = try catalog.skills[0].loadBody(a, io, .{});
+    defer a.free(original);
+    try t.expectEqualStrings("body", original);
+    try t.checkAllAllocationFailures(a, allocationRun, .{f.root});
+    try f.write("folder/SKILL.md", "---\ndescription: ok\n---\nbody");
+    try t.expectError(error.MetadataChanged, catalog.skills[0].loadBody(a, io, .{}));
+    var fallback = try f.catalog(.{});
+    defer fallback.deinit();
+    try t.expectEqualStrings("folder", fallback.skills[0].name);
+    try t.checkAllAllocationFailures(a, allocationRun, .{f.root});
+    try f.write("folder/SKILL.md", "---\nname: folder\ndescription: ok\nunknown: [true, 42]\n---\nbody");
+    const explicit = try fallback.skills[0].loadBody(a, io, .{});
+    defer a.free(explicit);
+    try t.expectEqualStrings("body", explicit);
+}
+
+test "different folders with one explicit name keep deterministic first valid precedence" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.write("a-invalid/SKILL.md", "---\nname: shared\ndescription: false\n---\nbody");
+    try f.write("b-first/SKILL.md", "---\nname: shared\ndescription: first\n---\nbody");
+    try f.write("c-second/SKILL.md", "---\nname: shared\ndescription: second\n---\nbody");
+    var catalog = try f.catalog(.{});
+    defer catalog.deinit();
+    try t.expectEqual(@as(usize, 1), catalog.skills.len);
+    try t.expectEqual(@as(usize, 2), catalog.diagnostics.len);
+    try t.expectEqualStrings("shared", catalog.skills[0].name);
+    try t.expectEqualStrings("first", catalog.skills[0].description);
+    try expectDiagnostic(catalog, error.UnsupportedFieldType);
+    try expectDiagnostic(catalog, error.DuplicateName);
 }
 
 test "caller allocator failures clean discovery diagnostics and body allocations" {

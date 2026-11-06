@@ -13,8 +13,7 @@ is needed. Include [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) when redistributin
 binaries or source bundles containing libyaml.
 
 ```sh
-zig build test -j2
-zig build test -j2 -Doptimize=ReleaseSafe
+zig build test
 ```
 
 Once you declare `skills` as a dependency in `build.zig.zon`, import its module
@@ -57,15 +56,46 @@ frontmatter is invalid. Inspect `catalog.diagnostics` for rejected entries.
 Use `Limits` to set discovery, YAML, and body budgets. Global discovery exhaustion
 returns `DiscoveryLimit` without a partial catalog.
 
-## Limitations
+## Frontmatter
 
-The parser rejects unknown frontmatter fields and duplicate keys. Fields must
-be strings, except `metadata`, which must map strings to strings. Numeric and
-boolean values are not converted to strings. Names must match the installed
-directory and use lowercase ASCII letters, digits, and single internal hyphens.
+The library reads the Agent Skills fields and accepts common
+[Claude Code frontmatter](https://code.claude.com/docs/en/skills#frontmatter-reference).
+Unknown fields are ignored, including nested hooks, lists, and booleans. They
+are never executed or used to change permissions or model settings.
+
+```yaml
+---
+description: >-
+  Review changes and explain what needs attention.
+allowed-tools: [Read, Grep]
+disable-model-invocation: true
+---
+```
+
+A missing `name` defaults to the installed folder name. An explicit name may
+differ from the folder, as in Claude Code. Names retain the Agent Skills syntax
+of 1 to 64 lowercase ASCII letters, digits, and single internal hyphens.
+`description` remains a required string of 1 to 1024 Unicode characters.
+`compatibility`, when present, is a string of 1 to 500 characters. `metadata`
+must map strings to strings. Numeric and boolean values in these fields are
+not converted to strings.
+
+`allowed-tools` accepts a string with spaces or commas, or a list of strings.
+The existing `Skill.allowed_tools` field preserves strings and joins list items
+with spaces. It is metadata only and grants no permissions.
+
+Libyaml handles quoted Unicode escapes, literal and folded block descriptions,
+and anchors and aliases. Unknown values still count toward YAML byte, node,
+and nesting budgets. Invalid YAML, duplicate frontmatter or metadata keys,
+and invalid known fields produce diagnostics without blocking valid skills in
+later roots. The library does not repair malformed YAML or read a description
+from the Markdown body.
+
+## Filesystem boundaries
+
 Explicit roots may follow directory symlinks. Child directory symlinks require
 `.symlinks = .allow_directory_links`, which permits targets outside the root.
-`SKILL.md` itself must never be a symlink. Body loading rejects changed metadata
-or a changed canonical directory path, but permits body edits. These checks are
-not a sandbox against concurrent filesystem replacement. Canonical paths require
-support from `std.Io` on the target platform.
+`SKILL.md` itself must never be a symlink. Body loading rejects changes to known
+metadata or the canonical directory path, but permits body edits and changes
+to ignored fields. These checks are not a sandbox against concurrent filesystem
+replacement. Canonical paths require support from `std.Io` on the target platform.

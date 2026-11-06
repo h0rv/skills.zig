@@ -40,7 +40,8 @@ pub const Skill = struct {
     license: ?[]const u8 = null,
     compatibility: ?[]const u8 = null,
     metadata: []const Entry = &.{},
-    /// Experimental raw string. This package grants no permissions.
+    /// Strings are preserved; YAML string lists are joined with spaces.
+    /// This package grants no permissions.
     allowed_tools: ?[]const u8 = null,
     source_path: []const u8 = "",
     directory_path: []const u8 = "",
@@ -63,7 +64,7 @@ pub const Skill = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         var issue: Issue = .{};
-        const current = try parse(arena.allocator(), header.yaml(), self.name, limits, &issue);
+        const current = try parse(arena.allocator(), header.yaml(), installedName(self.directory_path, self.resolved_directory_path), limits, &issue);
         if (!sameMetadata(self, current)) return error.MetadataChanged;
         var body: std.ArrayList(u8) = .empty;
         errdefer body.deinit(allocator);
@@ -125,6 +126,11 @@ fn rootName(root: []const u8) []const u8 {
     }
 }
 
+fn installedName(source: []const u8, resolved: []const u8) []const u8 {
+    const name = rootName(source);
+    return if (std.mem.eql(u8, name, "..")) path.basename(resolved) else name;
+}
+
 const Discovery = struct {
     allocator: Allocator,
     a: Allocator,
@@ -170,7 +176,7 @@ const Discovery = struct {
         const header = readHeader(self.allocator, self.io, file, self.limits, &self.bytes_left) catch |err| return self.diagnostic(source_path, err, .{});
         defer self.allocator.free(header.bytes);
         var issue: Issue = .{};
-        const installed_name = if (explicit and std.mem.eql(u8, name, "..")) path.basename(canonical) else name;
+        const installed_name = if (explicit) installedName(source, canonical) else name;
         var skill = parse(self.a, header.yaml(), installed_name, self.limits, &issue) catch |err| return self.diagnostic(source_path, err, issue);
         for (self.skills.items) |existing| {
             if (std.mem.eql(u8, existing.name, skill.name)) return self.diagnostic(source_path, error.DuplicateName, .{});
@@ -288,6 +294,7 @@ extern fn sy_parse([*]const u8, usize, usize, usize, *?*CDocument, *Issue) c_int
 extern fn sy_free(*CDocument) void;
 extern fn sy_root(*CDocument) Node;
 extern fn sy_pair(*CDocument, c_int, usize, *Node, *Node) void;
+extern fn sy_item(*CDocument, c_int, usize) Node;
 
 fn scalar(node: Node) ![]const u8 {
     if (node.kind != 1) return error.UnsupportedFieldType;
@@ -311,6 +318,20 @@ fn checkMap(doc: *CDocument, map: Node) !void {
     }
 }
 
+const Field = enum { name, description, license, compatibility, metadata, @"allowed-tools" };
+
+fn allowedTools(a: Allocator, doc: *CDocument, node: Node) ![]const u8 {
+    if (node.kind != 2) return a.dupe(u8, try scalar(node));
+    var value: std.ArrayList(u8) = .empty;
+    errdefer value.deinit(a);
+    for (0..node.len) |i| {
+        const item = try scalar(sy_item(doc, node.id, i));
+        if (i != 0) try value.append(a, ' ');
+        try value.appendSlice(a, item);
+    }
+    return value.toOwnedSlice(a);
+}
+
 fn parse(a: Allocator, yaml: []const u8, directory_name: []const u8, limits: Limits, issue: *Issue) !Skill {
     var document: ?*CDocument = null;
     switch (sy_parse(yaml.ptr, yaml.len, limits.max_yaml_nodes, limits.max_yaml_depth, &document, issue)) {
@@ -326,11 +347,14 @@ fn parse(a: Allocator, yaml: []const u8, directory_name: []const u8, limits: Lim
     defer sy_free(doc);
     const root = sy_root(doc);
     try checkMap(doc, root);
-    var skill: Skill = .{ .name = "", .description = "" };
+    var skill: Skill = .{ .name = directory_name, .description = "" };
     for (0..root.len) |i| {
         const field = pair(doc, root, i);
         const key = try scalar(field.key);
-        if (std.mem.eql(u8, key, "metadata")) {
+        // The bounded libyaml document is already parsed. Do not traverse or
+        // interpret unknown extension values, including aliases and tags.
+        const known = std.meta.stringToEnum(Field, key) orelse continue;
+        if (known == .metadata) {
             try checkMap(doc, field.value);
             const entries = try a.alloc(Entry, field.value.len);
             for (entries, 0..) |*entry, j| {
@@ -343,23 +367,21 @@ fn parse(a: Allocator, yaml: []const u8, directory_name: []const u8, limits: Lim
                 }
             }.less);
             skill.metadata = entries;
+        } else if (known == .@"allowed-tools") {
+            skill.allowed_tools = try allowedTools(a, doc, field.value);
         } else {
             const value = try scalar(field.value);
-            if (std.mem.eql(u8, key, "name")) {
-                skill.name = try a.dupe(u8, value);
-            } else if (std.mem.eql(u8, key, "description")) {
-                skill.description = try a.dupe(u8, value);
-            } else if (std.mem.eql(u8, key, "license")) {
-                skill.license = try a.dupe(u8, value);
-            } else if (std.mem.eql(u8, key, "compatibility")) {
-                skill.compatibility = try a.dupe(u8, value);
-            } else if (std.mem.eql(u8, key, "allowed-tools")) {
-                skill.allowed_tools = try a.dupe(u8, value);
-            } else return error.UnknownField;
+            switch (known) {
+                .name => skill.name = value,
+                .description => skill.description = try a.dupe(u8, value),
+                .license => skill.license = try a.dupe(u8, value),
+                .compatibility => skill.compatibility = try a.dupe(u8, value),
+                .metadata, .@"allowed-tools" => unreachable,
+            }
         }
     }
     if (!validName(skill.name)) return error.InvalidName;
-    if (!std.mem.eql(u8, skill.name, directory_name)) return error.DirectoryNameMismatch;
+    skill.name = try a.dupe(u8, skill.name);
     try characterLimit(skill.description, 1024);
     if (skill.compatibility) |value| try characterLimit(value, 500);
     return skill;
